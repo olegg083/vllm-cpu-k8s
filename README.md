@@ -1,88 +1,63 @@
-# vLLM (CPU) в Kubernetes: rootless-образ, приватные логи, PVC-кэш модели
+# vLLM (CPU) в Kubernetes
 
-Развёртывание `Qwen/Qwen2.5-0.5B-Instruct` на **vLLM 0.33.0** строго на CPU в Minikube.
+Развёртывание `Qwen/Qwen2.5-0.5B-Instruct` на **vLLM 0.33.0** (только CPU) в Minikube:
+rootless-образы с зафиксированными зависимостями, приватное логгирование запросов,
+кэш весов модели в PVC, секреты и конфигурация через `Secret` и `ConfigMap`.
 
-| Требование | Как выполнено |
-|---|---|
-| CPU, vLLM ≥ 0.27 | официальный `vllm-openai-cpu` v0.33.0, закреплён по digest |
-| Rootless | оба образа запускаются от UID 10001; в поде `runAsNonRoot`, `readOnlyRootFilesystem`, `drop: ALL`, seccomp `RuntimeDefault` |
-| Зафиксированные зависимости | `vllm_server/requirements.txt` и `model_downloader/requirements.txt` - полный freeze; сборка падает при расхождении (`check_requirements.py`) |
-| Приватные логи | `vllm_server/custom_logger.py`: логируется факт запроса, но не промпты/ответы |
-| PVC-кэш модели | первый старт скачивает веса с HF в PVC, рестарты берут их локально без сети |
-| Secret | HF-токен и Bearer-токен API в `Secret` |
-| ConfigMap | все параметры vLLM в `k8s/config/` |
-| Бонус 1 | `kubectl apply -k k8s/` |
-| Бонус 2 | загрузка весов в отдельном `initContainer` на лёгком rootless-образе (222 МБ) |
-| Бонус 3 | `loadtest/loadtest.py`, таблица метрик и аналитика ниже |
+Бонусы: **1** - `kubectl apply -k k8s/`; **2** - загрузка весов в отдельном `initContainer`  
+на лёгком rootless-образе; **3** - нагрузочное тестирование (раздел ниже).
 
 ## Структура
 
 ```text
 .
-├── vllm_server/               # образ vLLM
-│   ├── Dockerfile
-│   ├── custom_logger.py       # приватное логгирование (точка входа)
-│   ├── check_requirements.py  # сверка requirements.txt с окружением при сборке
-│   └── requirements.txt       # все пакеты с точными версиями
-├── model_downloader/          # отдельный лёгкий образ для initContainer
-│   ├── Dockerfile
-│   ├── download_model.py      # скрипт загрузки весов
-│   └── requirements.txt
-├── k8s/                       # kustomize-манифесты
-│   ├── kustomization.yaml
-│   ├── deployment.yaml  pvc.yaml  service.yaml
-│   ├── config/vllm.yaml       # параметры vLLM -> ConfigMap
-│   ├── config/model.env       # модель и CPU-переменные -> ConfigMap
-│   └── secrets.env.example    # шаблон секретов (реальный secrets.env в .gitignore)
-├── scripts/
-│   ├── create-secrets.sh      # генерирует k8s/secrets.env и .api_key
-│   └── check-privacy.sh       # проверка, что промпты не попадают в логи
-└── loadtest/
-    ├── loadtest.py            # нагрузочный тест (только stdlib)
-    └── results/results.json   # сырые результаты замеров
+├── vllm_server/        # образ vLLM: Dockerfile, custom_logger.py, requirements.txt
+├── model_downloader/   # лёгкий образ для initContainer: Dockerfile, download_model.py, requirements.txt
+├── k8s/                # kustomize-манифесты, config/ (ConfigMap), secrets.env.example
+├── scripts/            # create-secrets.sh, check-privacy.sh
+├── loadtest/           # loadtest.py и сырые результаты
 ```
 
-## Требования к ресурсам
+## Требования
 
-Проверено в Minikube (driver `docker`) на машине с 16 ГБ RAM (WSL2 выдан 11 ГБ):
+Docker, `kubectl`, Minikube. Проверено на машине с 16 ГБ RAM (WSL2 выдан 11 ГБ):
 
 ```bash
 minikube start --driver=docker --cpus=6 --memory=7g
 ```
 
-Под просит `requests: 2 CPU / 3 GiB`, `limits: 4 CPU / 6 GiB`. В замере при старте под занимал около 4,1 ГиБ. Лимит меньше 6 ГиБ ставить не стоит (см. «Ограничения»).
+Под просит `requests: 2 CPU / 3 GiB`, `limits: 4 CPU / 6 GiB`. Лимит памяти меньше 6 ГиБ не рекомендуется.
 
-## Быстрый старт
+## Запуск
+
+Все команды - из корня репозитория.
 
 ```bash
-# 1. Образы (из корня репозитория)
-docker build -t my-vllm:0.33.0-1        vllm_server
+# 1. Сборка образов
+docker build -t my-vllm:0.33.0-1         vllm_server
 docker build -t my-vllm-downloader:0.1.0 model_downloader
 
-# 2. Загрузить образы в Minikube
+# 2. Загрузка образов в Minikube
 minikube image load my-vllm:0.33.0-1
 minikube image load my-vllm-downloader:0.1.0
 
-# 3. Секреты: создаёт k8s/secrets.env и .api_key (HF_TOKEN можно оставить пустым для публичной модели)
+# 3. Секреты (HF_TOKEN можно оставить пустым для публичной модели)
 ./scripts/create-secrets.sh
 
 # 4. Деплой
 kubectl apply -k k8s/
-
-# 5. Следить за запуском
 kubectl get pods -w
-kubectl logs deploy/vllm -c download-model     # скачивание / "уже в PVC"
-kubectl logs deploy/vllm -c vllm               # сервер
 ```
 
-Первый старт: init-контейнер качает около 1 ГБ (1-2 минуты), затем vLLM грузит модель (~1 минута).
+Первый старт: init-контейнер скачивает около 1 ГБ (1-2 минуты), затем vLLM загружает модель (около минуты).
+Логи: `kubectl logs deploy/vllm -c download-model` и `kubectl logs deploy/vllm -c vllm`.
 
-### Проверка API
+### Проверка
 
 ```bash
 kubectl port-forward svc/vllm 8000:8000     # в отдельном терминале
 
-curl -s localhost:8000/health                                      # 200, без токена
+curl -s localhost:8000/health                                      # 200 (без токена)
 curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/v1/models  # 401 без токена
 
 curl -s localhost:8000/v1/chat/completions \
@@ -90,74 +65,33 @@ curl -s localhost:8000/v1/chat/completions \
   -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Привет! Ответь коротко."}],"max_tokens":64}'
 ```
 
-Первый запрос после старта заметно медленнее остальных (разогрев).
+Первый запрос после старта медленнее остальных (разогрев).
 
-## Как это устроено
+**Кэш модели.** `kubectl rollout restart deploy/vllm`, затем `kubectl logs deploy/vllm -c download-model`:
+при повторном запуске модель берётся из PVC без обращения к сети.
 
-### Кэш модели в PVC
-`initContainer` (`my-vllm-downloader`) запускает `download_model.py`:
-- в PVC нет маркера `.download_complete` -> скачивает модель с HF (с повторами при сбоях) и пишет маркер с `model_id` и `revision`;
-- маркер совпадает -> сразу выходит, **сеть не используется** (проверено: при перезапуске пода в логе `Модель ... уже в /models/..., сеть не нужна`);
-- в каталоге лежит другая модель/ревизия -> ошибка, файлы разных моделей не смешиваются.
+**Приватность логов.** `./scripts/check-privacy.sh` отправляет запросы с уникальным маркером и проверяет,
+что в логах пода нет ни маркера, ни промптов, но есть записи о факте обращения
+(`Model request received: id=... prompt_tokens=... max_tokens=...`).
 
-Основной контейнер монтирует PVC только на чтение и работает с `HF_HUB_OFFLINE=1`.
-Проверить: `kubectl rollout restart deploy/vllm`, затем `kubectl logs deploy/vllm -c download-model`.
+**Изменение параметров** без пересборки образа: правьте `k8s/config/vllm.yaml` и `k8s/config/model.env`,
+затем `kubectl apply -k k8s/` (под перезапустится сам).
 
-### Секреты
-`scripts/create-secrets.sh` пишет `k8s/secrets.env` (в `.gitignore`), из которого kustomize генерирует `Secret/vllm-secrets` с ключами:
-- `HF_TOKEN` - для скачивания закрытых/gated моделей (в init-контейнер);
-- `VLLM_API_KEY` - Bearer-токен для клиентов (в vLLM через env, а не через `--api-key`, чтобы он не попал в argv).
-
-В Secret-имя добавляется хэш: смена секрета перезапускает под. Шаблон: `k8s/secrets.env.example`.
-
-### Конфигурация
-- `k8s/config/vllm.yaml` - флаги `vllm serve` (`max-model-len`, `max-num-seqs`, `dtype`, ...) монтируются как `/etc/vllm/vllm.yaml`;
-- `k8s/config/model.env` - `MODEL_ID`, `MODEL_REVISION`, `MODEL_DIR` и CPU-переменные (`VLLM_CPU_KVCACHE_SPACE`, `VLLM_CPU_OMP_THREADS_BIND`).
-
-Изменили файл -> `kubectl apply -k k8s/`: ConfigMap получает новый хэш, под перезапускается сам, образ не пересобирается.
-
-### Приватное логгирование
-`custom_logger.py` перед запуском `vllm serve` подменяет методы штатного `RequestLogger`:
-- `log_inputs` пишет только `id`, число токенов промпта и `max_tokens`;
-- `log_request_body` и `log_outputs` отключены;
-- уровень логов принудительно `INFO` (на `DEBUG` vLLM печатает промпты).
-
-Пример строки в логе: `Model request received: id=chatcmpl-... prompt_tokens=38 max_tokens=24`.
-
-Проверка (нужен `port-forward`):
-
-```bash
-./scripts/check-privacy.sh
-```
-
-Скрипт отправляет запросы с уникальным маркером (обычный, стриминг, `/v1/completions`, невалидный с ошибкой 400) и убеждается, что маркера в логах нет, а записи о запросах есть. Результат прогона: `0` строк с маркером, `OK`.
-
-> Патч применяется в процессе API-сервера. Не используйте `api-server-count > 1`: дочерние API-процессы запускаются без патча.
-
-### Безопасность
-- UID 10001 с записью в `/etc/passwd` (иначе часть библиотек падает на `getpass.getuser()`).
-- Pod: `runAsNonRoot`, `readOnlyRootFilesystem` (записываемые `/tmp`, `/home/vllm`, `/dev/shm` - `emptyDir`), `allowPrivilegeEscalation: false`, `drop: ALL`, seccomp `RuntimeDefault`, `automountServiceAccountToken: false`.
-- API защищён Bearer-токеном (`/health` открыт для проб).
-- Отключены телеметрия и статистика использования (`VLLM_NO_USAGE_STATS`, `DO_NOT_TRACK`, `HF_HUB_DISABLE_TELEMETRY`).
-- Реальные секреты в git не попадают (`k8s/secrets.env`, `.api_key` в `.gitignore`).
-
-### Воспроизводимость
-Базовые образы закреплены по digest, `requirements.txt` - полный список `name==version`. На сборке `check_requirements.py` сравнивает его с реально установленными пакетами и падает при любом расхождении. Для воспроизводимости модели можно закрепить `MODEL_REVISION` (commit hash) в `k8s/config/model.env`.
-
-## Бонус 3: нагрузочное тестирование
-
-Запуск (при работающем `port-forward`):
+## Нагрузочное тестирование (бонус 3)
 
 ```bash
 export VLLM_API_KEY=$(cat .api_key)
 python3 loadtest/loadtest.py --max-tokens 64 --json-out loadtest/results/results.json
-# свои сценарии вида вид:конкурентность:запросов, вид = short | long
+# свои сценарии: вид:конкурентность:запросов, вид = short | long
 python3 loadtest/loadtest.py --scenarios short:8:32 long:1:4
 ```
 
-Метрики: **TTFT** - время до первого токена (стриминг), **Latency** - полное время запроса, **Throughput** - выходные токены в секунду по всем запросам (`sum(completion_tokens) / время теста`). Чтобы цифры были честными: к каждому промпту добавляется уникальный префикс (prefix caching не искажает TTFT), `ignore_eos` фиксирует длину ответа в 64 токена, перед замером делается прогрев, число токенов берётся из `usage` сервера.
+TTFT - время до первого токена, Latency - полное время запроса, Throughput - выходные токены в секунду
+по всем запросам. К каждому промпту добавляется уникальный префикс (prefix caching не искажает TTFT),
+длина ответа фиксирована (`ignore_eos`), перед замером выполняется прогрев.
 
-Условия: Minikube 7 GiB / 4 потока OpenMP, `enforce-eager`, `dtype=bfloat16`, `max-model-len=2048`, `max-num-seqs=4`, `max-num-batched-tokens=1024`. Короткий промпт ~72 токена, длинный ~1800 токенов (контекст модели 2048).
+Условия: Minikube 7 GiB, 4 потока OpenMP, `enforce-eager`, `dtype=bfloat16`, `max-model-len=2048`,
+`max-num-seqs=4`, `max-num-batched-tokens=1024`. Короткий промпт ~72 токена, длинный ~1800.
 
 | Сценарий | Конкур. | Запросов | Ошибок | Токенов промпта | Токенов ответа | TTFT avg, с | TTFT p95, с | Latency avg, с | Latency p95, с | Throughput, ток/с | Req/s |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -166,37 +100,27 @@ python3 loadtest/loadtest.py --scenarios short:8:32 long:1:4
 | long | 1 | 4 | 0 | 1796 | 64 | 27.07 | 27.68 | 31.81 | 32.43 | 2.0 | 0.03 |
 | long | 2 | 4 | 0 | 1796 | 64 | 38.41 | 54.99 | 62.11 | 76.76 | 2.1 | 0.03 |
 
-Что видно в цифрах:
-- **Короткие запросы.** С ростом конкурентности с 1 до 4 суммарный throughput растёт в 1,6 раза (10,6 -> 16,8 ток/с), а TTFT и latency растут в 2,5-2,7 раза: четыре запроса делят одни и те же 4 ядра.
-- **Длинные запросы.** TTFT ≈ 27 с на ~1800 токенов, то есть префилл идёт со скоростью около 66 токенов/с. Конкурентность 2 throughput не повышает (2,0 -> 2,1 ток/с), а TTFT и latency растут почти вдвое: префилл упирается в вычисления, и запросы просто стоят в очереди.
+### Аналитика 
 
-> Это замеры на одной конкретной (скромной) конфигурации, одной выборкой; для статистики нужны повторы. Рекомендации ниже опираются на эти цифры и документацию vLLM (`vllm serve --help`), сами изменения я **не** прогонял.
+В замерах: на коротких запросах конкурентность 1 -> 4 даёт рост throughput в 1,6 раза, но TTFT и latency растут
+в 2,5-2,7 раза. На длинных префилл идёт со скоростью около 66 токенов/с, и вторая параллельная заявка
+throughput не повышает (2,0 -> 2,1 ток/с), а только удваивает latency: префилл упирается в вычисления.
 
-### Что менять для роста Throughput
+**А) Много запросов с малым числом токенов:**
 
-**А) Большой поток запросов с малым числом токенов.** Узкое место - декодирование небольших запросов и накладные расходы на планирование.
-- Поднять `max-num-seqs` (сейчас 4 -> 16-32). KV-cache у модели 0.5B занимает около 12 КБ на токен, так что память под параллельные последовательности почти не растёт, а декод-шаг обрабатывает шире батч. Это главный рычаг: в замере throughput рос с конкурентностью, а лимит на 4 последовательности мешает ему расти дальше.
-- Согласовать `max-num-batched-tokens` с `max-num-seqs` и типичным размером промпта: за шаг должны помещаться префиллы новых запросов и декод активных.
-- Оставить включёнными `enable-prefix-caching` (общий системный промпт считается один раз) и chunked prefill (префилл не блокирует декод).
-- `async-scheduling` (флаг есть в 0.33) скрывает паузы планировщика между шагами; проверить на вашей нагрузке.
-- Если памяти хватает, убрать `enforce-eager`: `torch.compile` ускоряет CPU-инференс (но на 6 ГиБ с компиляцией под убивался по OOM - см. ниже).
-- Привязать потоки к физическим ядрам (`VLLM_CPU_OMP_THREADS_BIND`) и масштабироваться репликами с непересекающимися ядрами, а не раздувать один под: суперлинейного роста от числа потоков на CPU ждать не стоит.
+- поднять `max-num-seqs` (память под KV-cache у модели 0.5B почти не растёт), согласовать с ним `max-num-batched-tokens`;
+- оставить включёнными prefix caching и chunked prefill;
+- масштабироваться репликами с непересекающимися ядрами (`VLLM_CPU_OMP_THREADS_BIND`).
 
-**Б) Меньше запросов, но с огромным контекстом.** Узкое место - префилл (compute-bound); в замере именно он дал TTFT 27-55 с.
-- Включённый chunked prefill оставить; подобрать `max-num-batched-tokens` под размер чанка: крупные чанки эффективнее по матричным операциям, но дают всплеск памяти на прогреве (с значением по умолчанию у нас не хватало памяти при выделении KV-cache, помогло 1024), поэтому увеличивать вместе с лимитом памяти.
-- `long-prefill-token-threshold` ограничивает долю шага, которую может занять один длинный префилл, - защищает latency коротких запросов, идущих рядом с длинными.
-- Поднять `max-model-len` ровно до нужного размера и проверить `VLLM_CPU_KVCACHE_SPACE` / `kv-cache-memory-bytes`: для длинного контекста KV-cache нужно больше (для этой модели около 12 КБ на токен, для больших моделей - на порядки больше).
-- Уменьшить `max-num-seqs`: при редких, но тяжёлых запросах нет смысла резервировать память под много последовательностей.
-- Если один и тот же длинный документ запрашивают повторно, `enable-prefix-caching` убирает почти весь префилл (в тесте его нарочно ломали уникальным префиксом) - это самый сильный рычаг по TTFT.
-- Для ускорения самого префилла помогают только дополнительные ядра CPU: рост конкурентности его не ускоряет (видно в таблице).
+**Б) Мало запросов, но с огромным контекстом:**
 
-## Ограничения и найденные подводные камни
+- подобрать `max-num-batched-tokens` под размер чанка префилла (растёт и память на прогреве);
+- `long-prefill-token-threshold`, чтобы длинный запрос не задерживал короткие;
+- поднять `max-model-len` и объём KV-cache;
+- prefix caching для повторяющегося документа - основной рычаг по TTFT; для ускорения самого префилла нужны дополнительные ядра CPU.
 
-- **Память.** С `torch.compile` под убивался по OOM даже на 6 ГиБ; поэтому в `vllm.yaml` стоит `enforce-eager: true` (пик около 4,1 ГиБ). Большой `max-num-batched-tokens` раздувает память на прогреве (логиты по словарю 150 тыс.).
-- **`VLLM_PORT` от Service.** Service с именем `vllm` заставляет k8s подставить в под переменную `VLLM_PORT=tcp://...`, и vLLM падает. Поэтому в `deployment.yaml` стоит `enableServiceLinks: false`.
-- **Первый запрос медленный** (разогрев): в нагрузочном тесте он выполняется до замеров.
-- Образы грузятся в Minikube локально (`imagePullPolicy: IfNotPresent`, теги не `latest`). Для реального кластера запушьте образы в registry и поправьте `images:` в `k8s/kustomization.yaml`.
-- Содержимое запросов не пишется в логи приложения; логи самого Kubernetes/ноды и прокси перед сервисом этим патчем не охватываются.
+Замеры сделаны на одной конфигурации одним прогоном. Рекомендации опираются на эти цифры и справку
+`vllm serve --help`; сами изменения не замерялись. 
 
 ## Очистка
 
