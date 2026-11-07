@@ -1,0 +1,26 @@
+# Бонус 1: весь стек одной командой -> kubectl apply -k k8s/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - pvc.yaml
+  - service.yaml
+  - deployment.yaml
+
+images:
+  - name: my-vllm
+    newTag: 0.33.0-1
+  - name: my-vllm-downloader
+    newTag: 0.1.0
+
+configMapGenerator:
+  - name: vllm-config
+    files:
+      - vllm.yaml=config/vllm.yaml
+    envs:
+      - config/model.env
+
+secretGenerator:
+  - name: vllm-secrets
+    envs:
+      - secrets.env

@@ -1,0 +1,24 @@
+# Secrets
+k8s/secrets.env
+.api_key
+.env
+.env.*
+
+# Local binaries
+kubectl
+minikube-linux-amd64
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Model files and caches
+model_cache/
+models/
+.cache/
+
+
+# Личные заметки (не для сдачи)
+notes/

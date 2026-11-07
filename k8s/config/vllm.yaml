@@ -1,0 +1,16 @@
+# Параметры запуска vLLM (монтируется в контейнер как /etc/vllm/vllm.yaml)
+
+model: /models/Qwen--Qwen2.5-0.5B-Instruct
+served-model-name: Qwen/Qwen2.5-0.5B-Instruct
+host: 0.0.0.0
+port: 8000
+
+max-model-len: 2048
+max-num-seqs: 4
+max-num-batched-tokens: 1024
+dtype: bfloat16
+# Без torch.compile: на 6 ГиБ с компиляцией процесс убивался по OOM
+# в eager-режиме пик ~4.1 ГиБ. Если памяти много - можно убрать для скорости
+enforce-eager: true
+
+enable-log-requests: true
